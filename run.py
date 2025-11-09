@@ -240,10 +240,6 @@ def sigmoid(x):
 def tanh(x):
     return x
 
-def int32_div(a, b):
-    return (a/b).astype(jnp.int32) # FLOATING POINT: just for speed, int division is slow on GPUs
-    # return a//b
-
 def clipped_add(*a):
     return jnp.clip(sum(x.astype(jnp.int32) for x in a), -MAX, MAX).astype(DTYPE)
 
@@ -325,9 +321,9 @@ class EGG_LN(Model):
     def _forward(cls, common_params, x):
         # input is -127 to 127 range
         weight = call_submodule(Parameter, 'weight', common_params).astype(jnp.int32)
-        abs_sum = jnp.clip(jnp.dot(jnp.abs(x), jnp.ones_like(x), preferred_element_type=jnp.int32), min=1)
-        x_mean = jnp.clip(jnp.dot(x, jnp.ones_like(x), preferred_element_type=jnp.int32), min=1) // x.size # constant size, so regular bit shift
-        return jnp.clip(int32_div((x-x_mean) * weight * x.size, abs_sum), -MAX, MAX).astype(x.dtype)
+        abs_sum = (jnp.clip(jnp.dot(jnp.abs(x), jnp.ones_like(x), preferred_element_type=jnp.int32), min=1) // x.size)  # dividing by constant -> bit shift
+        numerator = (x * weight).astype(jnp.int16).view(jnp.uint16)
+        return common_params.noiser_params["DIVISION"][abs_sum][numerator]
     
     
 class EGG_GRU(Model):
@@ -355,7 +351,6 @@ class EGG_GRU(Model):
         )) # scaled from -127 to 127
 
         # [0, 254] * [-127, 127] // 254 -> [-127, 127]
-        # gated_past = ((ft.astype(jnp.int32) + MAX) * state.astype(jnp.int32) // (2 * MAX)).astype(x.dtype)
         gated_past = ((ft.astype(jnp.int32) + MAX) * state.astype(jnp.int32) >> (LOGMAX + 1)).astype(x.dtype)
         
         ht = tanh(clipped_add(
@@ -364,7 +359,6 @@ class EGG_GRU(Model):
             call_submodule(Parameter, 'bh', common_params)
         ))
 
-        # ht = state + (((ft.astype(jnp.int32) + MAX)) * (ht.astype(jnp.int32) - state.astype(jnp.int32)) // (2 * MAX)).astype(x.dtype)
         ht = state + (((ft.astype(jnp.int32) + MAX)) * (ht.astype(jnp.int32) - state.astype(jnp.int32)) >> (LOGMAX + 1)).astype(x.dtype)
         return ht, ht
 
@@ -503,7 +497,8 @@ class QEggRoll:
         """
         Return frozen_noiser_params and noiser_params
         """
-        return {"noise_reuse": noise_reuse, "rank": rank, "use_clt": use_clt, "fast_fitness": fast_fitness}, {"BIG_RAND_MATRIX": (jax.random.normal(jax.random.key(noise_seed), 2**30) * (2 ** FIXED_POINT)).astype(dtype), "sigma_shift": sigma_shift, "update_threshold": update_threshold}
+        frozen_division = jnp.clip(jnp.arange(2**16).astype(jnp.int16)[None, :] // jnp.arange(2**8).astype(jnp.uint8)[:, None], -MAX, MAX).astype(jnp.int8)  # precalculating
+        return {"noise_reuse": noise_reuse, "rank": rank, "use_clt": use_clt, "fast_fitness": fast_fitness}, {"BIG_RAND_MATRIX": (jax.random.normal(jax.random.key(noise_seed), 2**30) * (2 ** FIXED_POINT)).astype(dtype), "sigma_shift": sigma_shift, "update_threshold": update_threshold, "DIVISION": frozen_division}
 
     @classmethod
     def do_mm(cls, frozen_noiser_params, noiser_params, param, base_key, iterinfo, x):
