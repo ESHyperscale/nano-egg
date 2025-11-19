@@ -53,6 +53,8 @@ class Args:
     noise_reuse: int = 1
     tokens_per_update: int = 100
 
+    num_perturbations: int = 0
+
     group_size: int = 2
 
     dir_path: str = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cached_files")
@@ -617,6 +619,8 @@ def run_evolution():
     frozen_noiser_params, noiser_params = NOISER.init_noiser(params, args.sigma_shift, all_thresholds[0], dtype=args.dtype, noise_seed=args.seed, noise_reuse=args.noise_reuse, use_clt=args.use_clt, fast_fitness=args.fast_fitness)
 
     all_thread_idxes = jnp.arange(args.parallel_generations_per_gpu)
+    if args.num_perturbations != 0:
+        all_thread_idxes = all_thread_idxes % args.num_perturbations
     states = jnp.repeat(EGG.default_state(params, frozen_params)[None], args.parallel_generations_per_gpu, axis=0)
 
     LOG2TABLE = jnp.array((np.log2((np.arange(2**28) + 1) / (2 ** FBIT)) * (2 ** FBIT)).astype(np.int32)) # can be precalculated

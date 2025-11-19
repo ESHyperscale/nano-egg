@@ -1,1 +1,3 @@
 cached_files/
+sweeps/outputs
+sweeps/**.out

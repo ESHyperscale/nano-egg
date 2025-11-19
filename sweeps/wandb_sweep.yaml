@@ -1,0 +1,35 @@
+program: run.py
+name: pretrain_comp
+method: grid
+metric:
+  goal: minimize
+  name: avg_fitness
+parameters:
+  n_embd:
+    value: 256
+  alpha:
+    values: [0.0625, 0.125, 0.25, 4, 5, 6]
+  sigma_shift:
+    values: [3, 4, 5, 6]
+  num_perturbations:
+    values: [0, 2, 64, 512, 4096]
+  use_clt:
+    value: True
+  fast_fitness:
+    value: True
+  noise_reuse:
+    value: 1
+  track:
+    value: True
+  parallel_generations_per_gpu:
+    value: 32768
+  tokens_per_update:
+    value: 100
+  validate_every:
+    value: 10
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_boolean_flags}
