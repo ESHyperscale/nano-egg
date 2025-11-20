@@ -1,3 +1,5 @@
 cached_files/
 sweeps/outputs
 sweeps/**.out
+sweeps/wandb/
+wandb/

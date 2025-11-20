@@ -1,5 +1,5 @@
 program: run.py
-name: pretrain_comp
+name: pretrain_scale
 method: grid
 metric:
   goal: minimize
@@ -8,11 +8,11 @@ parameters:
   n_embd:
     value: 256
   alpha:
-    values: [0.0625, 0.125, 0.25, 4, 5, 6]
+    values: [0.125, 0.25, 3, 4]
   sigma_shift:
-    values: [3, 4, 5, 6]
+    value: 4
   num_perturbations:
-    values: [0, 2, 64, 512, 4096]
+    value: 0
   use_clt:
     value: True
   fast_fitness:
@@ -22,7 +22,9 @@ parameters:
   track:
     value: True
   parallel_generations_per_gpu:
-    value: 32768
+    values: [262144, 32768, 4096, 512, 64]
+  group_size:
+    value: 512
   tokens_per_update:
     value: 100
   validate_every:

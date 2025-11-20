@@ -4,6 +4,6 @@
 #SBATCH --output=wandb_sweep_evo_%A.out
 #SBATCH --gpus=8
 #SBATCH --ntasks-per-gpu=1
-#SBATCH --time=4:00:00         # Hours:Mins:Secs
+#SBATCH --time=12:00:00         # Hours:Mins:Secs
 
 srun --output=outputs/wandb_sweep_%A_%t.txt bash do_wandb.sh

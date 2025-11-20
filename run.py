@@ -308,8 +308,8 @@ class MLP(Model):
         num_blocks = len(common_params.params)
         for t in range(num_blocks):
             x = call_submodule(Linear, str(t), common_params, x)
-            if t != num_blocks - 1:
-                x = ACTIVATIONS[common_params.frozen_params['activation']](x)
+            # if t != num_blocks - 1:
+                # x = ACTIVATIONS[common_params.frozen_params['activation']](x)
         return x
 
 class EGG_LN(Model):
@@ -659,6 +659,7 @@ def run_evolution():
     print(jit_update.memory_analysis())
 
     full_dataset = np.load(os.path.join(args.dir_path, args.train_output_path))
+    args.group_size = min(args.group_size, args.parallel_generations_per_gpu)
     num_sequences = args.parallel_generations_per_gpu // args.group_size
     segments_per_sequence = (full_dataset.size - num_sequences) // (args.tokens_per_update * num_sequences)
     tokens_per_sequence = segments_per_sequence * args.tokens_per_update + 1
@@ -670,7 +671,7 @@ def run_evolution():
     truncated_dataset = full_dataset[:num_sequences * tokens_per_sequence].reshape((num_sequences, tokens_per_sequence))
 
     # full_name = f"int8_a{update_threshold}_s{args.sigma_shift}_{args.parallel_generations_per_gpu}x{args.tokens_per_update}x{args.noise_reuse}"
-    full_name = f"{args.dtype}_{args.n_embd}D{args.n_layer}L_a{args.alpha}_s{args.sigma_shift}_{args.parallel_generations_per_gpu}x{args.tokens_per_update}x{args.noise_reuse}"
+    full_name = f"{args.dtype}_{args.n_embd}D{args.n_layer}L_a{args.alpha}_s{args.sigma_shift}_{args.parallel_generations_per_gpu}/{args.group_size}x{args.tokens_per_update}x{args.noise_reuse}"
     print("Run name", full_name)
     if args.track:
         run = wandb.init(
