@@ -1,5 +1,7 @@
 cached_files/
+cache/
 sweeps/outputs
 sweeps/**.out
 sweeps/wandb/
 wandb/
+baselines/wandb/

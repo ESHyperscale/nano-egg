@@ -1,0 +1,23 @@
+program: run_transformer.py
+name: tf_1024r
+method: random
+metric:
+  goal: minimize
+  name: loss
+parameters:
+  lr:
+    distribution: log_uniform_values
+    max: !!float 0.25
+    min: !!float 0.0078125
+  lr_decay:
+    values: [True, False]
+  track:
+    value: True
+  batch_size:
+    value: 1024
+
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_boolean_flags}

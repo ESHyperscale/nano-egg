@@ -64,11 +64,11 @@ class Args:
     
     regenerate_model: bool = False
 
-    wandb_project: str = "HyperscalePretraining"
+    wandb_project: str = "HyperscalePretraining1"
     tag: str = ""
     track: bool = False
 
-    validate_every: int = 0
+    validate_every: int = 10
     validation_batch_size: int = 1024
 
 args = tyro.cli(Args)
