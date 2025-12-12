@@ -1,0 +1,20 @@
+#!/bin/bash
+
+#SBATCH --job-name=multinode
+#SBATCH --output=multinode.out
+#SBATCH --time=01:00:00         # Hours:Mins:Secs
+
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=4
+#SBATCH --ntasks-per-gpu=1
+
+hostname
+printenv
+nvidia-smi --list-gpus
+source ~/data/miniforge3/bin/activate && conda activate nanoegg && cd ~/data/nano-egg
+
+export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+echo "MASTER_ADDR:MASTER_PORT="${MASTER_ADDR}:${MASTER_PORT}
+
+srun --overlap --output slurm/outs/multinode_%t.outi slurm/multinode_inner.sh

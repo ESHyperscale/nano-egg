@@ -26,6 +26,11 @@ import time
 import wandb
 from pathlib import Path
 
+from jax import shard_map
+from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.experimental import multihost_utils as mu
+from jax.experimental.multihost_utils import process_allgather
+
 from typing import Optional, NamedTuple
 
 from functools import partial
@@ -45,6 +50,7 @@ class Args:
     sigma_shift: int = 4
     use_clt: bool = True
     fast_fitness: bool = True
+    alpha_decay_timestep: int = 1000  # keep fixed for hyperparameter tuning
 
     n_layer: int = 6
     n_embd: int = 256
@@ -71,7 +77,27 @@ class Args:
     validate_every: int = 10
     validation_batch_size: int = 1024
 
+    coord_addr: Optional[str] = None
+    num_procs: Optional[int] = None
+    proc_id: Optional[int] = None
+
 args = tyro.cli(Args)
+
+if args.coord_addr is not None:
+    jax.distributed.initialize(args.coord_addr, args.num_procs, int(os.environ.get('SLURM_PROCID', args.proc_id)), 0)
+
+total_num_devices = len(jax.devices())
+print("global devices", jax.devices())
+print("local devices", jax.local_devices())
+print("process id", jax.process_index())
+
+args.proc_id = jax.process_index()
+print("proc_id is", args.proc_id)
+args.total_parallel_generations = total_num_devices * args.parallel_generations_per_gpu
+args.update_batch_size = args.parallel_generations_per_gpu // 2
+assert args.validation_batch_size % total_num_devices == 0, "Validation batch size must be a multiple of total number of devices"
+
+mesh = jax.make_mesh((len(jax.devices()),), ('data',), axis_types=(jax.sharding.AxisType.Auto,))
 
 
 PARAM = 0
@@ -79,12 +105,6 @@ MM_PARAM = 1
 EMB_PARAM = 2
 
 FIXED_POINT = 4
-
-ACTIVATIONS = {
-    'relu': jax.nn.relu,
-    'silu': jax.nn.silu,
-    'pqn': lambda x: jax.nn.relu(layer_norm(x))
-}
 
 DTYPE = jnp.dtype(args.dtype)
 MAX = jnp.iinfo(DTYPE).max
@@ -308,8 +328,6 @@ class MLP(Model):
         num_blocks = len(common_params.params)
         for t in range(num_blocks):
             x = call_submodule(Linear, str(t), common_params, x)
-            # if t != num_blocks - 1:
-                # x = ACTIVATIONS[common_params.frozen_params['activation']](x)
         return x
 
 class EGG_LN(Model):
@@ -455,40 +473,57 @@ def get_nonlora_update_params(BIG_RAND_MATRIX, frozen_noiser_params, iterinfo, p
     updates = jax.lax.dynamic_slice_in_dim(BIG_RAND_MATRIX, start_idx, param.size * 2).reshape(param.shape + (2,)).astype(jnp.int32)
     return jnp.prod(updates, axis=-1) * anti_sign
 
-def _simple_full_update(frozen_noiser_params, noiser_params, param, key, scores, iterinfo):
-    updates = jax.vmap(partial(get_nonlora_update_params, noiser_params["BIG_RAND_MATRIX"], frozen_noiser_params), in_axes=(0, None, None))(iterinfo, param, key)
-
-    broadcasted_scores = jnp.reshape(scores, scores.shape + (1,) * len(param.shape))
-    if frozen_noiser_params["use_clt"]:
-        A = broadcasted_scores * updates.astype(jnp.int32)
-    else:
-        A = broadcasted_scores * jnp.sign(updates).astype(jnp.int32)
-    Z = jnp.sum(A, axis=0)
+def _common_update(frozen_noiser_params, noiser_params, param, Z, pop_size):
     param_int32 = param.astype(jnp.int32)
+
     if frozen_noiser_params["fast_fitness"]:
-        return jnp.clip(jnp.where(jnp.abs(Z) * (2 ** FIXED_POINT) < noiser_params["update_threshold"] * jnp.sqrt(scores.size) * (4 ** FIXED_POINT if frozen_noiser_params["use_clt"] else 1), param_int32, jnp.where(Z > 0, param_int32 + 1, param_int32 - 1)), -MAX, MAX).astype(param.dtype)
+        return jnp.clip(jnp.where(jnp.abs(Z) * (2 ** FIXED_POINT) < noiser_params["update_threshold"] * int(np.sqrt(pop_size)) * (4 ** FIXED_POINT if frozen_noiser_params["use_clt"] else 1), param_int32, jnp.where(Z > 0, param_int32 + 1, param_int32 - 1)), -MAX, MAX).astype(param.dtype)
     else:
-        return jnp.clip(jnp.where(jnp.abs(Z) < noiser_params["update_threshold"] * jnp.sqrt(scores.size) * (4 ** FIXED_POINT if frozen_noiser_params["use_clt"] else 1), param_int32, jnp.where(Z > 0, param_int32 + 1, param_int32 - 1)), -MAX, MAX).astype(dt)
+        return jnp.clip(jnp.where(jnp.abs(Z) < noiser_params["update_threshold"] * int(np.sqrt(pop_size)) * (4 ** FIXED_POINT if frozen_noiser_params["use_clt"] else 1), param_int32, jnp.where(Z > 0, param_int32 + 1, param_int32 - 1)), -MAX, MAX).astype(dt)
+
+def _simple_full_update(frozen_noiser_params, noiser_params, param, key, scores, iterinfo):
+    split_iterinfo = jax.tree.map(lambda x: jnp.reshape(x, (-1, args.update_batch_size)), iterinfo)
+    split_scores = jnp.reshape(scores, (-1, args.update_batch_size))
+
+    def scan_loop(Z, inputs):
+        iterinfo, scores = inputs
+    
+        updates = jax.vmap(partial(get_nonlora_update_params, noiser_params["BIG_RAND_MATRIX"], frozen_noiser_params), in_axes=(0, None, None))(iterinfo, param, key)
+
+        broadcasted_scores = jnp.reshape(scores, scores.shape + (1,) * len(param.shape))
+        if frozen_noiser_params["use_clt"]:
+            A = broadcasted_scores * updates.astype(jnp.int32)
+        else:
+            A = broadcasted_scores * jnp.sign(updates).astype(jnp.int32)
+        return Z + jnp.sum(A, axis=0), 0
+
+    Z, _ = jax.lax.scan(scan_loop, jnp.zeros_like(param).astype(jnp.int32), (split_iterinfo, split_scores))
+
+    return _common_update(frozen_noiser_params, noiser_params, param, Z, scores.size)
 
 def _simple_lora_update(frozen_noiser_params, noiser_params, param, key, scores, iterinfo):
-    A, B = jax.vmap(partial(get_lora_update_params, noiser_params["BIG_RAND_MATRIX"], frozen_noiser_params), in_axes=(0, None, None))(iterinfo, param, key)
-    broadcasted_scores = jnp.reshape(scores, scores.shape + (1,1))
+    
+    split_iterinfo = jax.tree.map(lambda x: jnp.reshape(x, (-1, args.update_batch_size)), iterinfo)
+    split_scores = jnp.reshape(scores, (-1, args.update_batch_size))
+
+    def scan_loop(Z, inputs):
+        iterinfo, scores = inputs
         
-    if frozen_noiser_params["use_clt"]:
-        if frozen_noiser_params["fast_fitness"]:
-            A = broadcasted_scores * A
+        A, B = jax.vmap(partial(get_lora_update_params, noiser_params["BIG_RAND_MATRIX"], frozen_noiser_params), in_axes=(0, None, None))(iterinfo, param, key)
+        broadcasted_scores = jnp.reshape(scores, scores.shape + (1,1))
+
+        if frozen_noiser_params["use_clt"]:
+            if frozen_noiser_params["fast_fitness"]:
+                A = broadcasted_scores * A
+            else:
+                A = broadcasted_scores.astype(jnp.int32) * A
+                A = (A >> FIXED_POINT).astype(jnp.int8)
         else:
-            A = broadcasted_scores.astype(jnp.int32) * A
-            A = (A >> FIXED_POINT).astype(jnp.int8)
-    else:
-        A = broadcasted_scores * jnp.sign(A)
-        B = jnp.sign(B)
-    Z = jnp.einsum('nir,njr->ij', A, B, preferred_element_type=jnp.int32) # TODO: fix for rank > 1
-    param_int32 = param.astype(jnp.int32)
-    if frozen_noiser_params["fast_fitness"]:
-        return jnp.clip(jnp.where(jnp.abs(Z) * (2 ** FIXED_POINT) < noiser_params["update_threshold"] * jnp.sqrt(scores.size) * (4 ** FIXED_POINT if frozen_noiser_params["use_clt"] else 1), param_int32, jnp.where(Z > 0, param_int32 + 1, param_int32 - 1)), -MAX, MAX).astype(param.dtype)
-    else:
-        return jnp.clip(jnp.where(jnp.abs(Z) < noiser_params["update_threshold"] * jnp.sqrt(scores.size) * (2 ** FIXED_POINT if frozen_noiser_params["use_clt"] else 1), param_int32, jnp.where(Z > 0, param_int32 + 1, param_int32 - 1)), -MAX, MAX).astype(param.dtype)
+            A = broadcasted_scores * jnp.sign(A)
+            B = jnp.sign(B)
+        return Z + jnp.einsum('nir,njr->ij', A, B, preferred_element_type=jnp.int32), 0 # TODO: fix for rank > 1
+    Z, _ = jax.lax.scan(scan_loop, jnp.zeros_like(param).astype(jnp.int32), (split_iterinfo, split_scores))
+    return _common_update(frozen_noiser_params, noiser_params, param, Z, scores.size)
 
 def _noop_update(noiser_params, base_sigma, ppf, param, key, scores, iterinfo, frozen_noiser_params):
     return param
@@ -545,7 +580,6 @@ class QEggRoll:
         perf_diff = (paired_scores[:, 0] - paired_scores[:, 1]) * (2 ** FIXED_POINT)
         rms = jnp.sqrt(perf_diff ** 2).astype(jnp.int32)
         return (perf_diff * (2 ** FIXED_POINT) // rms).astype(DTYPE) # has to do slow int division, but only if not fast_fitness
-        # return jnp.sign(paired_scores[:, 0] - paired_scores[:, 1]).astype(jnp.int8)
 
     @classmethod
     def _do_update(cls, frozen_noiser_params, noiser_params, param, base_key, fitnesses, iterinfos, map_classification):
@@ -554,7 +588,6 @@ class QEggRoll:
         if len(base_key.shape) == 0:
             updated_param = update_fn(frozen_noiser_params, noiser_params, param, base_key, fitnesses, iterinfos)
         else:
-            # updated_param = jax.lax.scan(lambda _, x: (0, update_fn(frozen_noiser_params, noiser_params, x[0], x[1], fitnesses, iterinfos)), 0, xs=(param, base_key), unroll=True)[1]
             updated_param = jax.vmap(update_fn, in_axes=(None, None, 0, 0, None, None))(frozen_noiser_params, noiser_params, param, base_key, fitnesses, iterinfos)
 
         return updated_param
@@ -589,6 +622,16 @@ def generate_thread(frozen_noiser_params, frozen_params, es_tree_key, LOG2TABLE,
     state, losses = jax.lax.scan(inner_scan, state, (input_tokens, target_tokens))
     return jnp.sum(losses), state
 
+def replicate_matrix(x):
+    return jax.make_array_from_single_device_arrays(x.shape, NamedSharding(mesh, P()), [jax.device_put(x, d) for d in jax.local_devices()])
+
+def get_hidden_states_shardmap(params, frozen_params, thread_ids):
+    def foo(params, thread_ids):
+        return jnp.repeat(EGG.default_state(params, frozen_params)[None], thread_ids.size, axis=0)
+
+    return shard_map(foo, mesh=mesh, in_specs=(P(), P('data')), out_specs=P('data'))(params, thread_ids)
+    
+
 def run_evolution():
     master_key = jax.random.key(args.seed)
     base_model_key = jax.random.fold_in(master_key, 0)
@@ -602,76 +645,102 @@ def run_evolution():
     else:
         print("REBUILDING PARAMS")
         full_params = EGG.rand_init(base_model_key, args.vocab_size, args.n_layer, args.n_embd, args.dtype)
-        save(full_params, path, True)
+        if args.proc_id == 0:
+            save(full_params, path, True)
         frozen_params, params, scan_map, es_map = full_params
+
+    params = jax.tree.map(replicate_matrix, params)
+        
     es_tree_key = simple_es_tree_key(params, base_es_key, scan_map)
     print("Num parameters", jax.tree.reduce(operator.add, jax.tree.map(lambda x: x.size, params)))
 
-
     if args.alpha > 1.0:
-        all_alphas = 1.0 / ((np.exp2(args.alpha) - 1.0) * (np.arange(args.num_epochs) / args.num_epochs) + 1.0) # ON CPU, can be precalcualted
+        all_alphas = 1.0 / ((np.exp2(args.alpha) - 1.0) * (np.arange(args.num_epochs) / args.alpha_decay_timestep) + 1.0) # ON CPU, can be precalcualted
     else:
         all_alphas = args.alpha * np.ones(args.num_epochs)
     all_thresholds = (scipy.stats.norm.ppf(1-all_alphas / 2) * (2 ** FBIT)).astype(np.int32) # ON CPU, can be precalculated
     
-    # print("Update threshold is", update_threshold / (2 ** FBIT), " instead of ", jax.scipy.stats.norm.ppf(1-args.alpha/2))
-
     frozen_noiser_params, noiser_params = NOISER.init_noiser(params, args.sigma_shift, all_thresholds[0], dtype=args.dtype, noise_seed=args.seed, noise_reuse=args.noise_reuse, use_clt=args.use_clt, fast_fitness=args.fast_fitness)
 
-    all_thread_idxes = jnp.arange(args.parallel_generations_per_gpu)
+    global_indices = replicate_matrix(np.arange(args.total_parallel_generations))
     if args.num_perturbations != 0:
-        all_thread_idxes = all_thread_idxes % args.num_perturbations
-    states = jnp.repeat(EGG.default_state(params, frozen_params)[None], args.parallel_generations_per_gpu, axis=0)
+        global_indices = global_indices % args.num_perturbations
+    global_val_indices = replicate_matrix(np.arange(args.validation_batch_size))
+    
+    # all_thread_idxes = jnp.arange(args.parallel_generations_per_gpu)
+    all_thread_idxes = jax.device_put(global_indices, NamedSharding(mesh, P('data')))
+    all_thread_val_idxes = jax.device_put(global_val_indices, NamedSharding(mesh, P('data')))
+    
+    # states = jnp.repeat(EGG.default_state(params, frozen_params)[None], args.parallel_generations_per_gpu, axis=0)
+    # _state = EGG.default_state(params, frozen_params)
+    # print(_state.is_fully_replicated, _state.is_fully_addressable)
+    # states = jax.make_array_from_single_device_arrays((args.total_parallel_generations,) + _state.shape, NamedSharding(mesh, P('data')),
+                                                      # [jnp.repeat(jax.device_put(_state[None], shard.device), args.parallel_generations_per_gpu, axis=0) for shard in all_thread_idxes.addressable_shards])
+    states = get_hidden_states_shardmap(params, frozen_params, all_thread_idxes)
 
-    LOG2TABLE = jnp.array((np.log2((np.arange(2**28) + 1) / (2 ** FBIT)) * (2 ** FBIT)).astype(np.int32)) # can be precalculated
+    valid_states = get_hidden_states_shardmap(params, frozen_params, all_thread_val_idxes)
+    # valid_states = jax.make_array_from_single_device_arrays((args.validation_batch_size,) + _state.shape, NamedSharding(mesh, P('data')),
+    #                                                   [jnp.repeat(jax.device_put(_state[None], shard.device), args.validation_batch_size // total_num_devices, axis=0) for shard in all_thread_idxes.addressable_shards])
+
+    LOG2TABLE = replicate_matrix(jnp.array((np.log2((np.arange(2**28) + 1) / (2 ** FBIT)) * (2 ** FBIT)).astype(np.int32))) # can be precalculated
     
     print("Compiling generate batch")
     start_time = time.time()
-    v_generate_thread = jax.jit(jax.vmap(partial(generate_thread, frozen_noiser_params, frozen_params, es_tree_key), in_axes=(None, None, None, 0, 0, 0, 0, None)), donate_argnums=5).lower(
-        LOG2TABLE, noiser_params, params, jax.ShapeDtypeStruct((args.parallel_generations_per_gpu, args.tokens_per_update), jnp.dtype('uint8')), jax.ShapeDtypeStruct((args.parallel_generations_per_gpu, args.tokens_per_update), jnp.dtype('uint8')), states, all_thread_idxes, 0
+    v_generate_thread = jax.jit(shard_map(
+        jax.vmap(partial(generate_thread, frozen_noiser_params, frozen_params, es_tree_key), in_axes=(None, None, None, 0, 0, 0, 0, None)),
+        mesh=mesh,
+        in_specs=(P(), P(), P(), P('data'), P('data'), P('data'), P('data'), P()),
+        out_specs=(P('data'), P('data'))
+    ), donate_argnums=5).lower(
+        LOG2TABLE, noiser_params, params, jax.ShapeDtypeStruct((args.total_parallel_generations, args.tokens_per_update), jnp.dtype('uint8')), jax.ShapeDtypeStruct((args.total_parallel_generations, args.tokens_per_update), jnp.dtype('uint8')), states, all_thread_idxes, 0
     ).compile()
     print("Compile time", time.time() - start_time)
     print("memory info")
     print(v_generate_thread.memory_analysis())
-
     
     print("Compiling validate")
     validation_dataset = np.load(os.path.join(args.dir_path, args.valid_output_path))
     num_tokens_per_validation_thread = validation_dataset.size // args.validation_batch_size
+    print("tokens per validation thread", num_tokens_per_validation_thread)
     validation_dataset = validation_dataset[:args.validation_batch_size*num_tokens_per_validation_thread].reshape((args.validation_batch_size, -1))
     start_time = time.time()
-    validate_model = jax.jit(jax.vmap(partial(generate_thread, frozen_noiser_params, frozen_params, es_tree_key), in_axes=(None, None, None, 0, 0, 0, 0, None)), donate_argnums=5).lower(
-        LOG2TABLE, noiser_params, params, validation_dataset[:, :-1], validation_dataset[:, 1:], jnp.repeat(EGG.default_state(params, frozen_params)[None], args.validation_batch_size, axis=0), jnp.arange(args.validation_batch_size), None
+    validate_model = jax.jit(shard_map(
+        jax.vmap(partial(generate_thread, frozen_noiser_params, frozen_params, es_tree_key), in_axes=(None, None, None, 0, 0, 0, 0, None)),
+        mesh=mesh,
+        in_specs=(P(), P(), P(), P('data'), P('data'), P('data'), P('data'), P()),
+        out_specs=(P('data'), P('data'))
+    ), donate_argnums=5).lower(
+        LOG2TABLE, noiser_params, params, validation_dataset[:, :-1], validation_dataset[:, 1:], valid_states, jnp.arange(args.validation_batch_size), None
     ).compile()
     print("Compile time", time.time() - start_time)
     print("memory info")
     print(validate_model.memory_analysis())
-    
 
     print()
     print("Compiling do update")
     start_time = time.time()
-    jit_update = jax.jit(lambda n, p, f, i: NOISER.do_updates(frozen_noiser_params, n, p, es_tree_key, f, i, es_map)).lower(
-        noiser_params, params, jax.ShapeDtypeStruct((args.parallel_generations_per_gpu >> 1,), jnp.dtype('int8')), (jnp.zeros(args.parallel_generations_per_gpu, dtype=jnp.int32), all_thread_idxes)
+    jit_update = jax.jit(shard_map(
+        lambda n, p, f, i: NOISER.do_updates(frozen_noiser_params, n, p, es_tree_key, f, i, es_map),
+        mesh=mesh,
+        in_specs=(P(), P(), P(), P()),
+        out_specs=(P(), P())
+    )).lower(
+        noiser_params, params, jax.ShapeDtypeStruct((args.total_parallel_generations >> 1,), jnp.dtype('int8')), (jnp.zeros(args.total_parallel_generations, dtype=jnp.int32), global_indices)
     ).compile()
     print("Compile time", time.time() - start_time)
     print("memory info")
     print(jit_update.memory_analysis())
 
     full_dataset = np.load(os.path.join(args.dir_path, args.train_output_path))
-    args.group_size = min(args.group_size, args.parallel_generations_per_gpu)
-    num_sequences = args.parallel_generations_per_gpu // args.group_size
+    args.group_size = min(args.group_size, args.total_parallel_generations)
+    num_sequences = args.total_parallel_generations // args.group_size
     segments_per_sequence = (full_dataset.size - num_sequences) // (args.tokens_per_update * num_sequences)
     tokens_per_sequence = segments_per_sequence * args.tokens_per_update + 1
-    print("total number of sequences is", num_sequences)
-    print("tokens per sequence is", tokens_per_sequence)
-    print("number of segments per sequence (total epochs until resample)", segments_per_sequence)
-    print("TARGETS: unigram gets 5.0 bits, bigram gets 4.0, and gzip w/ max compression gives 2.767 bits")
 
     truncated_dataset = full_dataset[:num_sequences * tokens_per_sequence].reshape((num_sequences, tokens_per_sequence))
 
     # full_name = f"int8_a{update_threshold}_s{args.sigma_shift}_{args.parallel_generations_per_gpu}x{args.tokens_per_update}x{args.noise_reuse}"
-    full_name = f"{args.dtype}_{args.n_embd}D{args.n_layer}L_a{args.alpha}_s{args.sigma_shift}_{args.parallel_generations_per_gpu}/{args.group_size}x{args.tokens_per_update}x{args.noise_reuse}"
+    full_name = f"{args.dtype}_{args.n_embd}D{args.n_layer}L_a{args.alpha}_s{args.sigma_shift}_{total_num_devices}x{args.parallel_generations_per_gpu}/{args.group_size}x{args.tokens_per_update}x{args.noise_reuse}"
     print("Run name", full_name)
     if args.track:
         run = wandb.init(
@@ -680,22 +749,29 @@ def run_evolution():
             name=full_name
         )
 
+    
+    print("total number of sequences is", num_sequences)
+    print("tokens per sequence is", tokens_per_sequence)
+    print("number of segments per sequence (total epochs until resample)", segments_per_sequence)
+    print("TARGETS: unigram gets 5.0 bits, bigram gets 4.0, and gzip w/ max compression gives 2.767 bits")
+
     for epoch in tqdm.trange(args.num_epochs):
         full_start_time = time.time()
 
         noiser_params["update_threshold"] = all_thresholds[epoch]
 
-        iterinfo = (jnp.full(args.parallel_generations_per_gpu, epoch, dtype=jnp.int32), all_thread_idxes)
+        iterinfo = (jnp.full(args.total_parallel_generations, epoch, dtype=jnp.int32), global_indices)
 
         start_tok = (epoch % segments_per_sequence) * args.tokens_per_update
-        full_obs = truncated_dataset[:, start_tok:start_tok+args.tokens_per_update + 1]
+        full_obs = jax.device_put(truncated_dataset[:, start_tok:start_tok+args.tokens_per_update + 1], NamedSharding(mesh, P('data')))
         batch_obs = jnp.repeat(full_obs, args.group_size, axis=0)
 
         batch_inputs = batch_obs[:, :-1]
         batch_targets = batch_obs[:, 1:]
 
         start_time = time.time()
-        raw_scores, states = jax.block_until_ready(v_generate_thread(LOG2TABLE, noiser_params, params, batch_inputs, batch_targets, states, jnp.arange(args.parallel_generations_per_gpu), epoch))
+        _raw_scores, states = jax.block_until_ready(v_generate_thread(LOG2TABLE, noiser_params, params, batch_inputs, batch_targets, states, all_thread_idxes, epoch))
+        raw_scores = process_allgather(_raw_scores, True)
         generate_time = time.time() - start_time
         # num_nans = jnp.sum(jnp.isnan(raw_scores))
 
@@ -723,22 +799,30 @@ def run_evolution():
             "max_fitness": -max_fitness,
             "lora_differences": lora_differences,
             "nonlora_differences": nonlora_differences,
-            "throughput": args.tokens_per_update * args.parallel_generations_per_gpu / (end_time - full_start_time),
+            "throughput": args.tokens_per_update * args.total_parallel_generations / (end_time - full_start_time),
             "generate_time": generate_time,
-            "update_time": update_time
+            "update_time": update_time,
+            "data": (epoch + 1) * args.tokens_per_update * num_sequences
         }
 
         if args.validate_every != 0 and epoch % args.validate_every == args.validate_every - 1:
             valid_start_time = time.time()
-            validate_states = EGG.default_state(params, frozen_params)
-            raw_scores, _ = jax.block_until_ready(validate_model(LOG2TABLE, noiser_params, params, validation_dataset[:, :-1], validation_dataset[:, 1:], jnp.repeat(EGG.default_state(params, frozen_params)[None], args.validation_batch_size, axis=0), jnp.arange(args.validation_batch_size), None))
+            # valid_states = jax.make_array_from_single_device_arrays((args.validation_batch_size,) + _state.shape, NamedSharding(mesh, P('data')),
+            #                                           [jnp.repeat(jax.device_put(_state[None], shard.device), args.validation_batch_size // total_num_devices, axis=0) for shard in all_thread_idxes.addressable_shards])
+            valid_states = get_hidden_states_shardmap(params, frozen_params, all_thread_val_idxes)
+            _raw_scores, _ = jax.block_until_ready(validate_model(LOG2TABLE, noiser_params, params, validation_dataset[:, :-1], validation_dataset[:, 1:], valid_states, jnp.arange(args.validation_batch_size), None))
+            raw_scores = process_allgather(_raw_scores, True)
             valid_time = time.time() - valid_start_time
             float_validation_score = -jnp.sum(raw_scores) / ((validation_dataset.size - args.validation_batch_size) * (2 ** FBIT))
             valid_throughput = (validation_dataset.size - args.validation_batch_size) / valid_time
             stats["validation_score"] = float_validation_score
             stats["valid_time"] = valid_time
             stats["validation_throughput"] = valid_throughput
-            print("validation score", float_validation_score, "validation throughput is", valid_throughput, "validation time is", valid_time)
+            if args.proc_id == 0:
+                print("validation score", float_validation_score, "validation throughput is", valid_throughput, "validation time is", valid_time)
+
+        if args.proc_id != 0:
+            continue
         
         if args.track:
             run.log(stats)
@@ -753,7 +837,7 @@ def run_evolution():
 
 def build_dataset():
     path = Path(os.path.join(args.dir_path, args.train_output_path))
-    if path.is_file():
+    if path.is_file() or args.proc_id != 0:
         return
         
     os.makedirs(args.dir_path, exist_ok=True)

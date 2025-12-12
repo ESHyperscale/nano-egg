@@ -1,16 +1,18 @@
 program: run.py
-name: pretrain_scale
+name: pretrain_vary
 method: grid
 metric:
   goal: minimize
   name: avg_fitness
 parameters:
   n_embd:
-    value: 256
+    values: [16, 64, 256]
+  n_layer:
+    values: [1, 2, 4, 8]
   alpha:
-    values: [0.125, 0.25, 3, 4]
+    values: [0.0625, 0.125, 0.25, 3, 4, 5]
   sigma_shift:
-    value: 4
+    values: [3, 4, 5]
   num_perturbations:
     value: 0
   use_clt:
@@ -22,7 +24,7 @@ parameters:
   track:
     value: True
   parallel_generations_per_gpu:
-    values: [262144, 32768, 4096, 512, 64]
+    values: [262144, 32768, 4096]
   group_size:
     value: 512
   tokens_per_update:

@@ -1,7 +1,7 @@
 import os
 import numpy as np
 
-dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cached_files")
+dir_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../cached_files")
 # valid_output_path = "minipile_train.npy"
 valid_output_path = "minipile_valid.npy"
 

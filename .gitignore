@@ -5,3 +5,4 @@ sweeps/**.out
 sweeps/wandb/
 wandb/
 baselines/wandb/
+slurm/outs/
